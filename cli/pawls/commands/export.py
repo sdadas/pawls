@@ -17,7 +17,7 @@ from pawls.commands.utils import (
 )
 from pawls.preprocessors.model import *
 
-ALL_SUPPORTED_EXPORT_TYPE = ["coco", "token"]
+ALL_SUPPORTED_EXPORT_TYPE = ["coco", "token", "multimodal"]
 
 
 def _convert_bounds_to_coco_bbox(bounds: Dict[str, Union[int, float]]):
@@ -318,6 +318,158 @@ class TokenTableBuilder:
         return df
 
 
+class MultimodalBuilder:
+
+    class MultimodalAnnotations(NamedTuple):
+        file_name: str
+        file_sha: str
+        annotations: List
+
+        def to_dict(self):
+            return {
+                "file_name": self.file_name,
+                "file_sha": self.file_sha,
+                "annotations": [val.to_dict() for val in self.annotations]
+            }
+
+    class PageAnnotations(NamedTuple):
+        page_num: int
+        width: float
+        height: float
+        page_image_path: str
+        tokens: List[str]
+        boxes: List[Tuple]
+        user_annotations: Dict
+
+        def to_dict(self):
+            return {
+                "page_num": self.page_num,
+                "width": self.width,
+                "height": self.height,
+                "page_image_path": self.page_image_path,
+                "tokens": self.tokens,
+                "boxes": self.boxes,
+                "user_annotations": {key: val.to_dict() for key, val in self.user_annotations.items()}
+            }
+
+    class UserAnnotations(NamedTuple):
+        username: str
+        labels: List
+        annotation_ids: List
+        freeform: List
+
+        def to_dict(self):
+            return {
+                "username": self.username,
+                "labels": self.labels,
+                "annotation_ids": self.annotation_ids,
+                "freeform": [val.to_dict() for val in self.freeform]
+            }
+
+    class FreeformAnnotation(NamedTuple):
+        label: str
+        box: Tuple
+
+        def to_dict(self):
+            return {"label": self.label, "box": self.box}
+
+
+    def __init__(self, categories: List, save_path: str):
+        self.categories = categories
+        self.save_path = save_path
+        self._save_path_annotations = os.path.join(self.save_path, "annotations")
+        self._save_path_images = os.path.join(self.save_path, "images")
+        self.annotations: Dict[str, MultimodalBuilder.MultimodalAnnotations] = {}
+        self.all_page_token_data = {}
+        self.output_papers = set()
+        os.makedirs(self._save_path_annotations, exist_ok=True)
+        os.makedirs(self._save_path_images, exist_ok=True)
+
+    def create_paper_data(self, annotation_folder: AnnotationFolder):
+        for pdf in annotation_folder.all_pdfs:
+            paper_sha = get_pdf_sha(pdf)
+            if not annotation_folder.has_annotations(paper_sha):
+                continue
+            annotations = self.MultimodalAnnotations(os.path.basename(pdf), paper_sha, [])
+            all_pages = annotation_folder.get_pdf_tokens(pdf)
+            for idx, page_tokens in enumerate(all_pages):
+                image_path = os.path.join(self._save_path_images, f"{paper_sha}_{idx}.png")
+                page = self.PageAnnotations(
+                    page_num=page_tokens.page.index,
+                    width=page_tokens.page.width,
+                    height=page_tokens.page.height,
+                    page_image_path=image_path,
+                    tokens=[], boxes=[], user_annotations={}
+                )
+                for token in page_tokens.tokens:
+                    page.tokens.append(token.text)
+                    page.boxes.append(token.coordinates)
+                annotations.annotations.append(page)
+            self.annotations[paper_sha] = annotations
+            self.all_page_token_data[paper_sha] = all_pages
+
+    def save_images(self, pdf: str, paper_sha: str) -> List[str]:
+        _, page_sizes = get_pdf_pages_and_sizes(pdf)
+        images = convert_from_path(pdf)
+        results = []
+        for idx, image in enumerate(images):
+            page_size = page_sizes[idx]
+            image_path = os.path.join(self._save_path_images, f"{paper_sha}_{idx}.png")
+            image.resize(page_size).save(image_path)
+            results.append(image_path)
+        return results
+
+    def create_annotation_for_annotator(self, annotator: str, anno_files: AnnotationFiles):
+        pbar = tqdm(anno_files)
+        for anno_file in pbar:
+            paper_sha = anno_file["paper_sha"]
+            paper: MultimodalBuilder.MultimodalAnnotations = self.annotations[paper_sha]
+            page_token_data = self.all_page_token_data[paper_sha]
+            pawls_annotations = load_json(anno_file["annotation_path"])["annotations"]
+            for anno_id, anno in enumerate(pawls_annotations):
+                page_num = anno["page"]
+                page: MultimodalBuilder.PageAnnotations = paper.annotations[page_num]
+                if annotator in page.user_annotations:
+                    user_annotations = page.user_annotations[annotator]
+                else:
+                    user_annotations = self.UserAnnotations(
+                        username=annotator,
+                        labels=["" for _ in range(len(page.tokens))],
+                        annotation_ids=[-1 for _ in range(len(page.tokens))],
+                        freeform=[],
+                    )
+                    page.user_annotations[annotator] = user_annotations
+                label = anno["label"]["text"]
+                # Free-form
+                if anno["tokens"] is None:
+                    anno_token_indices = find_tokens_in_anno_block(anno, page_token_data)
+                    bounds = anno["bounds"]
+                    box = (bounds["left"], bounds["top"], bounds["right"], bounds["bottom"])
+                    user_annotations.freeform.append(self.FreeformAnnotation(label, box))
+                    if len(anno_token_indices) == 0:
+                        continue
+                else:
+                    anno_token_indices = [
+                        (ele["pageIndex"], ele["tokenIndex"]) for ele in anno["tokens"]
+                    ]
+
+                for page_idx, token_idx in anno_token_indices:
+                    user_annotations.labels[token_idx] = label
+                    user_annotations.annotation_ids[token_idx] = anno_id
+            self.output_papers.add(paper_sha)
+        pbar.close()
+
+    def export(self, annotation_folder: AnnotationFolder):
+        for paper_sha in self.output_papers:
+            paper = self.annotations[paper_sha]
+            pdf_path = f"{annotation_folder.path}/{paper.file_sha}/{paper.file_name}"
+            self.save_images(pdf_path, paper.file_sha)
+            output_path = os.path.join(self._save_path_annotations, f"{paper.file_sha}.json")
+            output_obj = paper.to_dict()
+            with open(output_path, "w", encoding="utf-8") as output_file:
+                json.dump(output_obj, output_file, ensure_ascii=False)
+
+
 @click.command(context_settings={"help_option_names": ["--help", "-h"]})
 @click.argument("path", type=click.Path(exists=True, file_okay=False))
 @click.argument("config", type=str)
@@ -437,3 +589,20 @@ def export(
         print(
             f"Successfully exported annotations for {len(df)} tokens from annotators {all_annotators} to {output}."
         )
+
+    elif format == "multimodal":
+
+        multimodal_builder = MultimodalBuilder(categories, output)
+
+        print(f"Creating paper data for annotation folder {annotation_folder.path}")
+        multimodal_builder.create_paper_data(annotation_folder)
+
+        for annotator in all_annotators:
+            anno_files = AnnotationFiles(path, annotator, include_unfinished, pdf_shas)
+            multimodal_builder.create_annotation_for_annotator(annotator, anno_files)
+
+        multimodal_builder.export(annotation_folder)
+        print(
+            f"Successfully exported {len(multimodal_builder.output_papers)} annotations of annotator {annotator} to {output}."
+        )
+

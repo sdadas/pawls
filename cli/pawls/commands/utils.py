@@ -133,6 +133,14 @@ class AnnotationFolder:
 
         return AnnotationFile(annotation_file_path)
 
+    def has_annotations(self, paper_sha: str) -> bool:
+        pdf_path = os.path.join(self.path, paper_sha)
+        files = os.listdir(pdf_path)
+        for file in files:
+            if os.path.isfile(os.path.join(pdf_path, file)) and "_annotations.json" in file:
+                return True
+        return False
+
 
 class AnnotationFile:
     def __init__(self, filepath: str):
